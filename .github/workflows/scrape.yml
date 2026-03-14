@@ -1,0 +1,95 @@
+name: Scrape ADFG Data
+
+# Trigger manually from GitHub (works from phone)
+on:
+  workflow_dispatch:
+    inputs:
+      species:
+        description: "Species to scrape (comma-separated or 'all')"
+        required: true
+        default: "all"
+        type: choice
+        options:
+          - all
+          - caribou
+          - sheep
+          - moose
+          - goat
+          - bison
+          - elk
+          - muskox
+          - caribou,sheep
+          - caribou,sheep,moose
+      years:
+        description: "Year range (e.g., 2010-2024)"
+        required: true
+        default: "2010-2024"
+        type: string
+      source:
+        description: "Data source"
+        required: true
+        default: "both"
+        type: choice
+        options:
+          - both
+          - lookup
+          - reports
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Chrome
+        uses: browser-actions/setup-chrome@v1
+        with:
+          chrome-version: "stable"
+
+      - name: Install dependencies
+        run: |
+          pip install selenium webdriver-manager pandas
+
+      - name: Run scraper
+        run: |
+          python scraper.py \
+            --source ${{ inputs.source }} \
+            --species "${{ inputs.species }}" \
+            --years "${{ inputs.years }}"
+
+      - name: Check for new data
+        id: check
+        run: |
+          if [ -n "$(git status data/ --porcelain)" ]; then
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Commit and push data
+        if: steps.check.outputs.has_changes == 'true'
+        run: |
+          git config user.name "ADFG Scraper Bot"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/
+          git commit -m "Update ${{ inputs.species }} harvest data (${{ inputs.years }})"
+          git push
+
+      - name: Upload data as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: harvest-data
+          path: data/*.csv
+          if-no-files-found: ignore
