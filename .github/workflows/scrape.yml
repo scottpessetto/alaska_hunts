@@ -1,0 +1,143 @@
+name: Scrape ADFG Data
+
+# Trigger manually from GitHub (works from phone)
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Mode: 'scrape' to collect data, 'discover' to inspect page elements"
+        required: true
+        default: "discover"
+        type: choice
+        options:
+          - discover
+          - scrape
+      species:
+        description: "Species to scrape (ignored in discover mode)"
+        required: true
+        default: "all"
+        type: choice
+        options:
+          - all
+          - caribou
+          - sheep
+          - moose
+          - goat
+          - bison
+          - elk
+          - muskox
+          - caribou,sheep
+          - caribou,sheep,moose
+      years:
+        description: "Year range (ignored in discover mode)"
+        required: true
+        default: "2010-2024"
+        type: string
+      source:
+        description: "Data source (ignored in discover mode)"
+        required: true
+        default: "both"
+        type: choice
+        options:
+          - both
+          - lookup
+          - reports
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Chrome
+        uses: browser-actions/setup-chrome@v1
+        with:
+          chrome-version: "stable"
+
+      - name: Install dependencies
+        run: |
+          pip install selenium webdriver-manager pandas
+
+      - name: Run scraper (discover mode)
+        if: inputs.mode == 'discover'
+        run: |
+          python scraper.py --discover 2>&1 | tee discover_output.txt
+
+      - name: Run scraper (scrape mode)
+        if: inputs.mode == 'scrape'
+        run: |
+          python scraper.py \
+            --source ${{ inputs.source }} \
+            --species "${{ inputs.species }}" \
+            --years "${{ inputs.years }}" 2>&1 | tee scrape_output.txt
+
+      - name: Save page HTML snapshots (discover mode)
+        if: inputs.mode == 'discover'
+        run: |
+          python -c "
+          from scraper import create_driver, HARVEST_LOOKUP_URL, HARVEST_REPORTS_URL
+          import time, os
+          os.makedirs('snapshots', exist_ok=True)
+          driver = create_driver()
+          try:
+              driver.get(HARVEST_LOOKUP_URL)
+              time.sleep(5)
+              with open('snapshots/harvest_lookup.html', 'w') as f:
+                  f.write(driver.page_source)
+              driver.get(HARVEST_REPORTS_URL)
+              time.sleep(5)
+              with open('snapshots/harvest_reports.html', 'w') as f:
+                  f.write(driver.page_source)
+          finally:
+              driver.quit()
+          print('Saved HTML snapshots')
+          "
+
+      - name: Upload discover artifacts
+        if: inputs.mode == 'discover'
+        uses: actions/upload-artifact@v4
+        with:
+          name: page-discovery
+          path: |
+            discover_output.txt
+            snapshots/
+
+      - name: Check for new data
+        if: inputs.mode == 'scrape'
+        id: check
+        run: |
+          if [ -n "$(git status data/ --porcelain)" ]; then
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Commit and push data
+        if: inputs.mode == 'scrape' && steps.check.outputs.has_changes == 'true'
+        run: |
+          git config user.name "ADFG Scraper Bot"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/
+          git commit -m "Update ${{ inputs.species }} harvest data (${{ inputs.years }})"
+          git push
+
+      - name: Upload scrape output
+        if: inputs.mode == 'scrape'
+        uses: actions/upload-artifact@v4
+        with:
+          name: scrape-results
+          path: |
+            scrape_output.txt
+            data/*.csv
+          if-no-files-found: ignore
