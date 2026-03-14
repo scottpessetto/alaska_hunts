@@ -6,7 +6,7 @@ Scrapes hunting harvest data from the Alaska Department of Fish & Game website
 using Selenium (the site blocks non-browser requests).
 
 Two data sources:
-  - harvest_lookup: Individual harvest records with data download
+  - harvest_lookup: Individual harvest records with Excel download
   - harvest_reports: Summary reports with success rates by hunt
 
 Usage:
@@ -17,6 +17,7 @@ Usage:
 
 import argparse
 import csv
+import glob as globmod
 import os
 import sys
 import time
@@ -45,8 +46,20 @@ DATA_DIR = Path(__file__).parent / "data"
 
 POLITE_DELAY = 2.5  # seconds between requests
 
+# --- Discovered element IDs/names from ADFG pages ---
+# Harvest Lookup page (secure.wildlife.alaska.gov):
+#   Dropdowns: id='year' name='YEAR', id='species' name='Species',
+#              id='mtnRange' name='mtnherd', id='gmu_list' name='GMU',
+#              id='hunt_list' name='HUNT'
+#   Buttons:   value='Search', name='Action' value='Display Records',
+#              name='Action' value='Create Excel File'
+#
+# Harvest Reports page (secure.wildlife.alaska.gov):
+#   Dropdowns: name='YEAR' (no id), name='Species' (no id)
+#   Buttons:   value='Search', name='Action' value='Get Reports'
 
-def create_driver(interactive=False):
+
+def create_driver(interactive=False, download_dir=None):
     """Create a Selenium Chrome WebDriver."""
     options = Options()
     if not interactive:
@@ -59,50 +72,57 @@ def create_driver(interactive=False):
         "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     )
 
+    # Configure download directory for Excel files
+    if download_dir:
+        prefs = {
+            "download.default_directory": str(download_dir),
+            "download.prompt_for_download": False,
+            "download.directory_upgrade": True,
+        }
+        options.add_experimental_option("prefs", prefs)
+
     service = Service(ChromeDriverManager().install())
     driver = webdriver.Chrome(service=service, options=options)
     driver.implicitly_wait(10)
     return driver
 
 
-def select_dropdown(driver, element_id, value, by_visible_text=True):
-    """Select a value from a dropdown by visible text or value attribute."""
+def select_by_id(driver, element_id, value):
+    """Select a dropdown option by element ID and visible text."""
     try:
         select_el = Select(driver.find_element(By.ID, element_id))
-        if by_visible_text:
-            select_el.select_by_visible_text(value)
-        else:
-            select_el.select_by_value(value)
+        select_el.select_by_visible_text(value)
+        return True
+    except (NoSuchElementException, Exception) as e:
+        print(f"  WARNING: Could not select '{value}' in #{element_id}: {e}")
+        return False
+
+
+def select_by_name(driver, name, value):
+    """Select a dropdown option by element name and visible text."""
+    try:
+        select_el = Select(driver.find_element(By.NAME, name))
+        select_el.select_by_visible_text(value)
+        return True
+    except (NoSuchElementException, Exception) as e:
+        print(f"  WARNING: Could not select '{value}' in name='{name}': {e}")
+        return False
+
+
+def click_button(driver, value):
+    """Click an input/button by its value attribute."""
+    try:
+        btn = driver.find_element(By.CSS_SELECTOR, f"input[value='{value}']")
+        btn.click()
         return True
     except NoSuchElementException:
-        # Try finding by name if ID doesn't work
         try:
-            select_el = Select(driver.find_element(By.NAME, element_id))
-            if by_visible_text:
-                select_el.select_by_visible_text(value)
-            else:
-                select_el.select_by_value(value)
+            btn = driver.find_element(By.CSS_SELECTOR, f"button[value='{value}']")
+            btn.click()
             return True
         except NoSuchElementException:
-            print(f"  WARNING: Could not find dropdown '{element_id}'")
+            print(f"  WARNING: Button with value='{value}' not found")
             return False
-
-
-def find_and_click(driver, text=None, element_id=None, css=None):
-    """Find and click an element by text content, ID, or CSS selector."""
-    try:
-        if element_id:
-            el = driver.find_element(By.ID, element_id)
-        elif css:
-            el = driver.find_element(By.CSS_SELECTOR, css)
-        elif text:
-            el = driver.find_element(By.XPATH, f"//*[contains(text(), '{text}')]")
-        else:
-            return False
-        el.click()
-        return True
-    except NoSuchElementException:
-        return False
 
 
 def parse_html_table(driver, table_index=0):
@@ -120,7 +140,7 @@ def parse_html_table(driver, table_index=0):
     header_cells = rows[0].find_elements(By.TAG_NAME, "th")
     if not header_cells:
         header_cells = rows[0].find_elements(By.TAG_NAME, "td")
-    headers = [cell.text.strip().lower().replace(" ", "_") for cell in header_cells]
+    headers = [cell.text.strip().lower().replace(" ", "_").replace("#", "num") for cell in header_cells]
 
     if not headers:
         return []
@@ -138,10 +158,10 @@ def parse_html_table(driver, table_index=0):
 
 def find_data_table(driver):
     """Find the main data table on the page, trying multiple strategies."""
-    # Strategy 1: Look for tables with common harvest data headers
     tables = driver.find_elements(By.TAG_NAME, "table")
     harvest_keywords = {"hunt", "year", "gmu", "harvest", "hunter", "permit", "success",
-                        "killed", "hunted", "unit", "species"}
+                        "killed", "hunted", "unit", "species", "num_permits", "num_hunters",
+                        "num_harvested", "did_hunt", "reporting"}
 
     for i, table in enumerate(tables):
         header_row = table.find_elements(By.TAG_NAME, "tr")
@@ -154,7 +174,7 @@ def find_data_table(driver):
         if header_text & harvest_keywords:
             return parse_html_table(driver, i)
 
-    # Strategy 2: Parse largest table on the page
+    # Fallback: parse largest table
     if tables:
         largest_idx = 0
         largest_rows = 0
@@ -169,6 +189,19 @@ def find_data_table(driver):
     return []
 
 
+def wait_for_download(download_dir, timeout=30):
+    """Wait for a file to appear in the download directory."""
+    start = time.time()
+    while time.time() - start < timeout:
+        files = globmod.glob(os.path.join(download_dir, "*"))
+        # Filter out partial downloads (.crdownload, .tmp)
+        complete = [f for f in files if not f.endswith((".crdownload", ".tmp", ".part"))]
+        if complete:
+            return max(complete, key=os.path.getmtime)
+        time.sleep(1)
+    return None
+
+
 def discover_page_elements(driver, url):
     """Navigate to a URL and report all form elements found. For debugging."""
     driver.get(url)
@@ -179,7 +212,6 @@ def discover_page_elements(driver, url):
     print(f"Title: {driver.title}")
     print(f"{'='*60}")
 
-    # Find all selects
     selects = driver.find_elements(By.TAG_NAME, "select")
     print(f"\nDropdowns ({len(selects)}):")
     for sel in selects:
@@ -190,7 +222,6 @@ def discover_page_elements(driver, url):
         suffix = f" ... (+{len(options)-10} more)" if len(options) > 10 else ""
         print(f"  id='{sel_id}' name='{sel_name}': {option_texts}{suffix}")
 
-    # Find all buttons/inputs of type submit
     buttons = driver.find_elements(By.CSS_SELECTOR, "input[type='submit'], button[type='submit'], input[type='button']")
     print(f"\nButtons ({len(buttons)}):")
     for btn in buttons:
@@ -199,7 +230,6 @@ def discover_page_elements(driver, url):
         btn_val = btn.get_attribute("value") or btn.text or "(no label)"
         print(f"  id='{btn_id}' name='{btn_name}' value='{btn_val}'")
 
-    # Find all links
     links = driver.find_elements(By.TAG_NAME, "a")
     harvest_links = [l for l in links if any(kw in (l.text.lower() + (l.get_attribute("href") or "").lower())
                                               for kw in ["download", "export", "csv", "lookup", "report", "harvest"])]
@@ -208,7 +238,6 @@ def discover_page_elements(driver, url):
         href = link.get_attribute("href") or "(no href)"
         print(f"  '{link.text.strip()}' -> {href}")
 
-    # Find tables
     tables = driver.find_elements(By.TAG_NAME, "table")
     print(f"\nTables ({len(tables)}):")
     for i, table in enumerate(tables):
@@ -222,21 +251,17 @@ def discover_page_elements(driver, url):
     print()
 
 
-def scrape_harvest_lookup(driver, species_list, year_start, year_end):
+def scrape_harvest_lookup(driver, species_list, year_start, year_end, download_dir=None):
     """
-    Scrape the Harvest Lookup / Data Download tool.
+    Scrape the Harvest Lookup tool using the 'Create Excel File' button.
 
-    This source provides individual harvest records that can be filtered
-    by species, year, GMU, and hunt number.
+    Page elements (confirmed via discover):
+      - id='year' name='YEAR': year dropdown
+      - id='species' name='Species': species dropdown
+      - value='Create Excel File': downloads Excel with all records
+      - value='Display Records': shows results in browser
     """
-    all_records = {}  # species -> list of records
-
-    driver.get(HARVEST_LOOKUP_URL)
-    time.sleep(3)
-
-    # First, discover the page structure
-    print("Discovering Harvest Lookup page structure...")
-    discover_page_elements(driver, HARVEST_LOOKUP_URL)
+    all_records = {}
 
     for species in species_list:
         species_cap = species.capitalize()
@@ -250,54 +275,22 @@ def scrape_harvest_lookup(driver, species_list, year_start, year_end):
                 driver.get(HARVEST_LOOKUP_URL)
                 time.sleep(POLITE_DELAY)
 
-                # Try to select species and year
-                # Note: exact element IDs/names depend on the page structure
-                # Common patterns on ColdFusion ADFG pages:
-                species_selected = (
-                    select_dropdown(driver, "species", species_cap) or
-                    select_dropdown(driver, "SpeciesID", species_cap) or
-                    select_dropdown(driver, "species_id", species_cap)
-                )
-
-                year_selected = (
-                    select_dropdown(driver, "year", str(year)) or
-                    select_dropdown(driver, "Year", str(year)) or
-                    select_dropdown(driver, "reg_year", str(year))
-                )
-
-                if not species_selected:
-                    print("SKIP (species dropdown not found)")
-                    continue
-                if not year_selected:
-                    print("SKIP (year dropdown not found)")
+                # Select year (id='year')
+                if not select_by_id(driver, "year", str(year)):
+                    print("SKIP (year)")
                     continue
 
-                # Submit the form
-                submitted = (
-                    find_and_click(driver, css="input[type='submit']") or
-                    find_and_click(driver, text="Search") or
-                    find_and_click(driver, text="Lookup") or
-                    find_and_click(driver, text="Submit")
-                )
-
-                if not submitted:
-                    print("SKIP (submit button not found)")
+                # Select species (id='species')
+                if not select_by_id(driver, "species", species_cap):
+                    print("SKIP (species)")
                     continue
 
-                time.sleep(POLITE_DELAY)
+                # Click 'Display Records' to get results in browser
+                if not click_button(driver, "Display Records"):
+                    print("SKIP (no Display Records button)")
+                    continue
 
-                # Try to find a download link/button first
-                download_clicked = (
-                    find_and_click(driver, text="Download") or
-                    find_and_click(driver, text="Export") or
-                    find_and_click(driver, text="CSV")
-                )
-
-                if download_clicked:
-                    time.sleep(2)
-                    # Check downloads directory for new files
-                    # For now, fall through to table parsing
-                    print("(download attempted)", end=" ")
+                time.sleep(POLITE_DELAY + 2)  # extra wait for results to load
 
                 # Parse the results table
                 table_data = find_data_table(driver)
@@ -324,16 +317,12 @@ def scrape_harvest_reports(driver, species_list, year_start, year_end):
     """
     Scrape the General Harvest Reports tool.
 
-    This source provides summary tables with permits, hunters,
-    harvest counts, and success rates by hunt code.
+    Page elements (confirmed via discover):
+      - name='YEAR' (no id): year dropdown
+      - name='Species' (no id): species dropdown
+      - value='Get Reports': generates the report table
     """
     all_records = {}
-
-    driver.get(HARVEST_REPORTS_URL)
-    time.sleep(3)
-
-    print("Discovering Harvest Reports page structure...")
-    discover_page_elements(driver, HARVEST_REPORTS_URL)
 
     for species in species_list:
         species_cap = species.capitalize()
@@ -347,41 +336,24 @@ def scrape_harvest_reports(driver, species_list, year_start, year_end):
                 driver.get(HARVEST_REPORTS_URL)
                 time.sleep(POLITE_DELAY)
 
-                # Select species and year
-                species_selected = (
-                    select_dropdown(driver, "species", species_cap) or
-                    select_dropdown(driver, "SpeciesID", species_cap) or
-                    select_dropdown(driver, "species_id", species_cap)
-                )
-
-                year_selected = (
-                    select_dropdown(driver, "year", str(year)) or
-                    select_dropdown(driver, "Year", str(year)) or
-                    select_dropdown(driver, "reg_year", str(year))
-                )
-
-                if not species_selected:
-                    print("SKIP (species dropdown not found)")
-                    continue
-                if not year_selected:
-                    print("SKIP (year dropdown not found)")
+                # Select year (name='YEAR', no id)
+                if not select_by_name(driver, "YEAR", str(year)):
+                    print("SKIP (year)")
                     continue
 
-                # Submit
-                submitted = (
-                    find_and_click(driver, css="input[type='submit']") or
-                    find_and_click(driver, text="Generate") or
-                    find_and_click(driver, text="Report") or
-                    find_and_click(driver, text="Submit")
-                )
-
-                if not submitted:
-                    print("SKIP (submit button not found)")
+                # Select species (name='Species', no id)
+                if not select_by_name(driver, "Species", species_cap):
+                    print("SKIP (species)")
                     continue
 
-                time.sleep(POLITE_DELAY)
+                # Click 'Get Reports'
+                if not click_button(driver, "Get Reports"):
+                    print("SKIP (no Get Reports button)")
+                    continue
 
-                # Parse results table
+                time.sleep(POLITE_DELAY + 2)  # extra wait for report to generate
+
+                # Parse the results table
                 table_data = find_data_table(driver)
                 if table_data:
                     for row in table_data:
@@ -411,20 +383,20 @@ def normalize_records(records):
     """
     normalized = []
 
-    # Build column name mapping (ADFG pages use various naming)
+    # Column name mapping (ADFG pages use various naming conventions)
     col_map = {
-        "hunt": ["hunt", "hunt_#", "hunt_no", "hunt_number", "hunt_code"],
+        "hunt": ["hunt", "hunt_num", "hunt_no", "hunt_number", "hunt_code"],
         "gmu": ["gmu", "unit", "game_management_unit", "area"],
-        "permits": ["permits", "permits_issued", "#_permits", "total_permits"],
-        "hunters": ["hunters", "#_hunters", "total_hunters", "did_hunt", "hunted"],
-        "harvest": ["harvest", "total_harvest", "#_harvested", "killed", "animals_harvested"],
-        "success_rate": ["success_rate", "%_success", "success_%", "success", "pct_success"],
+        "permits": ["permits", "permits_issued", "num_permits", "total_permits"],
+        "hunters": ["hunters", "num_hunters", "total_hunters", "did_hunt", "hunted"],
+        "harvest": ["harvest", "total_harvest", "num_harvested", "killed", "animals_harvested", "harvested"],
+        "success_rate": ["success_rate", "%_success", "success_%", "success", "pct_success",
+                         "percent_success", "success_percent"],
     }
 
     for record in records:
         row = {"year": record.get("year", ""), "species": record.get("species", "")}
 
-        # Map each target column to whatever the source called it
         for target, candidates in col_map.items():
             for candidate in candidates:
                 if candidate in record:
@@ -467,7 +439,7 @@ def save_records(records_by_species):
             if col in all_cols:
                 ordered_cols.append(col)
                 all_cols.discard(col)
-        ordered_cols.extend(sorted(all_cols))  # remaining columns
+        ordered_cols.extend(sorted(all_cols))
 
         # If file exists, merge with existing data
         existing = []
