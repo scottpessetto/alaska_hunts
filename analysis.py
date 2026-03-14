@@ -129,23 +129,24 @@ def render_animal_page(animal_name, csv_path):
             st.warning("No data for the selected GMU(s) and year range.")
             return
 
-        # Metric cards for each selected GMU
-        cols = st.columns(min(len(selected_hunts), 4))
-        for i, hunt in enumerate(selected_hunts):
-            hunt_data = df_selected[df_selected["hunt"] == hunt].sort_values("year")
-            if hunt_data.empty:
-                continue
-            col = cols[i % len(cols)]
-            latest_rate = hunt_data.iloc[-1]["success_rate"]
-            avg_rate = hunt_data["success_rate"].mean()
-            slope = compute_trend(hunt_data["year"].values, hunt_data["success_rate"].values)
-            delta = f"{slope * 100:+.1f}%/yr"
-            col.metric(
-                label=f"{hunt}",
-                value=f"{latest_rate:.0%}",
-                delta=delta,
-                help=f"Latest year: {latest_rate:.1%} | Avg: {avg_rate:.1%}",
-            )
+        # Metric cards for each selected GMU (2 per row for mobile)
+        for row_start in range(0, len(selected_hunts), 2):
+            row_hunts = selected_hunts[row_start:row_start + 2]
+            cols = st.columns(len(row_hunts))
+            for i, hunt in enumerate(row_hunts):
+                hunt_data = df_selected[df_selected["hunt"] == hunt].sort_values("year")
+                if hunt_data.empty:
+                    continue
+                latest_rate = hunt_data.iloc[-1]["success_rate"]
+                avg_rate = hunt_data["success_rate"].mean()
+                slope = compute_trend(hunt_data["year"].values, hunt_data["success_rate"].values)
+                delta = f"{slope * 100:+.1f}%/yr"
+                cols[i].metric(
+                    label=f"{hunt}",
+                    value=f"{latest_rate:.0%}",
+                    delta=delta,
+                    help=f"Latest year: {latest_rate:.1%} | Avg: {avg_rate:.1%}",
+                )
 
         # Line chart — pivot so each GMU is a column
         chart_data = df_selected.pivot_table(
@@ -245,19 +246,23 @@ def render_animal_page(animal_name, csv_path):
         scored_df["score"] = 0.6 * scored_df["avg_rate"] + 0.4 * scored_df["norm_slope"]
         scored_df = scored_df.sort_values("score", ascending=False)
 
-        # Show top 5 as metric cards
+        # Show top 5 as metric cards (2 per row for mobile)
         top_n = min(5, len(scored_df))
         top = scored_df.head(top_n)
-        cols = st.columns(top_n)
+        top_list = list(top.iterrows())
 
-        for i, (_, row) in enumerate(top.iterrows()):
-            delta = f"{row['slope'] * 100:+.1f}%/yr"
-            cols[i].metric(
-                label=f"#{i+1}: {row['hunt']}",
-                value=f"{row['avg_rate']:.0%}",
-                delta=delta,
-            )
-            cols[i].caption(f"{row['total_hunters']} hunters over {row['years']} years")
+        for row_start in range(0, len(top_list), 2):
+            row_items = top_list[row_start:row_start + 2]
+            cols = st.columns(len(row_items))
+            for i, (_, row) in enumerate(row_items):
+                rank = row_start + i + 1
+                delta = f"{row['slope'] * 100:+.1f}%/yr"
+                cols[i].metric(
+                    label=f"#{rank}: {row['hunt']}",
+                    value=f"{row['avg_rate']:.0%}",
+                    delta=delta,
+                )
+                cols[i].caption(f"{row['total_hunters']} hunters over {row['years']} years")
 
         # Combined line chart of top picks
         st.subheader("Trend Comparison")
