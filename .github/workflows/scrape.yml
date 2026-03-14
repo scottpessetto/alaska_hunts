@@ -4,8 +4,16 @@ name: Scrape ADFG Data
 on:
   workflow_dispatch:
     inputs:
+      mode:
+        description: "Mode: 'scrape' to collect data, 'discover' to inspect page elements"
+        required: true
+        default: "discover"
+        type: choice
+        options:
+          - discover
+          - scrape
       species:
-        description: "Species to scrape (comma-separated or 'all')"
+        description: "Species to scrape (ignored in discover mode)"
         required: true
         default: "all"
         type: choice
@@ -21,12 +29,12 @@ on:
           - caribou,sheep
           - caribou,sheep,moose
       years:
-        description: "Year range (e.g., 2010-2024)"
+        description: "Year range (ignored in discover mode)"
         required: true
         default: "2010-2024"
         type: string
       source:
-        description: "Data source"
+        description: "Data source (ignored in discover mode)"
         required: true
         default: "both"
         type: choice
@@ -61,14 +69,52 @@ jobs:
         run: |
           pip install selenium webdriver-manager pandas
 
-      - name: Run scraper
+      - name: Run scraper (discover mode)
+        if: inputs.mode == 'discover'
+        run: |
+          python scraper.py --discover 2>&1 | tee discover_output.txt
+
+      - name: Run scraper (scrape mode)
+        if: inputs.mode == 'scrape'
         run: |
           python scraper.py \
             --source ${{ inputs.source }} \
             --species "${{ inputs.species }}" \
-            --years "${{ inputs.years }}"
+            --years "${{ inputs.years }}" 2>&1 | tee scrape_output.txt
+
+      - name: Save page HTML snapshots (discover mode)
+        if: inputs.mode == 'discover'
+        run: |
+          python -c "
+          from scraper import create_driver, HARVEST_LOOKUP_URL, HARVEST_REPORTS_URL
+          import time, os
+          os.makedirs('snapshots', exist_ok=True)
+          driver = create_driver()
+          try:
+              driver.get(HARVEST_LOOKUP_URL)
+              time.sleep(5)
+              with open('snapshots/harvest_lookup.html', 'w') as f:
+                  f.write(driver.page_source)
+              driver.get(HARVEST_REPORTS_URL)
+              time.sleep(5)
+              with open('snapshots/harvest_reports.html', 'w') as f:
+                  f.write(driver.page_source)
+          finally:
+              driver.quit()
+          print('Saved HTML snapshots')
+          "
+
+      - name: Upload discover artifacts
+        if: inputs.mode == 'discover'
+        uses: actions/upload-artifact@v4
+        with:
+          name: page-discovery
+          path: |
+            discover_output.txt
+            snapshots/
 
       - name: Check for new data
+        if: inputs.mode == 'scrape'
         id: check
         run: |
           if [ -n "$(git status data/ --porcelain)" ]; then
@@ -78,7 +124,7 @@ jobs:
           fi
 
       - name: Commit and push data
-        if: steps.check.outputs.has_changes == 'true'
+        if: inputs.mode == 'scrape' && steps.check.outputs.has_changes == 'true'
         run: |
           git config user.name "ADFG Scraper Bot"
           git config user.email "github-actions[bot]@users.noreply.github.com"
@@ -86,10 +132,12 @@ jobs:
           git commit -m "Update ${{ inputs.species }} harvest data (${{ inputs.years }})"
           git push
 
-      - name: Upload data as artifact
-        if: always()
+      - name: Upload scrape output
+        if: inputs.mode == 'scrape'
         uses: actions/upload-artifact@v4
         with:
-          name: harvest-data
-          path: data/*.csv
+          name: scrape-results
+          path: |
+            scrape_output.txt
+            data/*.csv
           if-no-files-found: ignore
