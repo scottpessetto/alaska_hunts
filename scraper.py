@@ -6,19 +6,20 @@ Scrapes hunting harvest data from the Alaska Department of Fish & Game website
 using Selenium (the site blocks non-browser requests).
 
 Two data sources:
-  - harvest_lookup: Individual harvest records with Excel download
+  - harvest_lookup: Individual harvest records via 'Display Records'
   - harvest_reports: Summary reports with success rates by hunt
 
 Usage:
-  python scraper.py --source lookup --species caribou,sheep --years 2010-2024
-  python scraper.py --source reports --species all --years 1975-2024
-  python scraper.py --source lookup --species all --years 2000-2024 --interactive
+  python scraper.py --source reports --species caribou --years 2023-2024
+  python scraper.py --source reports --species all --years 2010-2024
+  python scraper.py --source both --species caribou,sheep --years 2015-2024
 """
 
 import argparse
 import csv
 import glob as globmod
 import os
+import signal
 import sys
 import time
 from pathlib import Path
@@ -33,6 +34,7 @@ from selenium.common.exceptions import (
     NoSuchElementException,
     TimeoutException,
     StaleElementReferenceException,
+    WebDriverException,
 )
 from webdriver_manager.chrome import ChromeDriverManager
 
@@ -44,22 +46,31 @@ HARVEST_REPORTS_URL = "https://secure.wildlife.alaska.gov/index.cfm?fuseaction=h
 
 DATA_DIR = Path(__file__).parent / "data"
 
-POLITE_DELAY = 2.5  # seconds between requests
+POLITE_DELAY = 2.0  # seconds between requests
+PAGE_LOAD_TIMEOUT = 30  # max seconds to wait for a page/results to load
+PER_ITERATION_TIMEOUT = 45  # max seconds per species+year iteration
 
 # --- Discovered element IDs/names from ADFG pages ---
-# Harvest Lookup page (secure.wildlife.alaska.gov):
-#   Dropdowns: id='year' name='YEAR', id='species' name='Species',
-#              id='mtnRange' name='mtnherd', id='gmu_list' name='GMU',
-#              id='hunt_list' name='HUNT'
-#   Buttons:   value='Search', name='Action' value='Display Records',
-#              name='Action' value='Create Excel File'
+# Harvest Lookup page:
+#   id='year' name='YEAR', id='species' name='Species'
+#   id='gmu_list' name='GMU', id='hunt_list' name='HUNT'
+#   Buttons: value='Display Records', value='Create Excel File'
 #
-# Harvest Reports page (secure.wildlife.alaska.gov):
-#   Dropdowns: name='YEAR' (no id), name='Species' (no id)
-#   Buttons:   value='Search', name='Action' value='Get Reports'
+# Harvest Reports page:
+#   name='YEAR' (no id), name='Species' (no id)
+#   Buttons: value='Get Reports'
 
 
-def create_driver(interactive=False, download_dir=None):
+class IterationTimeout(Exception):
+    """Raised when a single scrape iteration takes too long."""
+    pass
+
+
+def _timeout_handler(signum, frame):
+    raise IterationTimeout("Iteration timed out")
+
+
+def create_driver(interactive=False):
     """Create a Selenium Chrome WebDriver."""
     options = Options()
     if not interactive:
@@ -72,18 +83,10 @@ def create_driver(interactive=False, download_dir=None):
         "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     )
 
-    # Configure download directory for Excel files
-    if download_dir:
-        prefs = {
-            "download.default_directory": str(download_dir),
-            "download.prompt_for_download": False,
-            "download.directory_upgrade": True,
-        }
-        options.add_experimental_option("prefs", prefs)
-
     service = Service(ChromeDriverManager().install())
     driver = webdriver.Chrome(service=service, options=options)
-    driver.implicitly_wait(10)
+    driver.set_page_load_timeout(PAGE_LOAD_TIMEOUT)
+    driver.implicitly_wait(5)  # reduced from 10 to fail faster
     return driver
 
 
@@ -121,8 +124,24 @@ def click_button(driver, value):
             btn.click()
             return True
         except NoSuchElementException:
-            print(f"  WARNING: Button with value='{value}' not found")
+            print(f"  WARNING: Button '{value}' not found")
             return False
+
+
+def wait_for_results(driver, timeout=15):
+    """Wait for results to appear after form submission."""
+    start = time.time()
+    while time.time() - start < timeout:
+        tables = driver.find_elements(By.TAG_NAME, "table")
+        # Look for a table that appeared after the form (more than the initial form tables)
+        for table in tables:
+            rows = table.find_elements(By.TAG_NAME, "tr")
+            if len(rows) > 2:  # has actual data rows
+                header_cells = rows[0].find_elements(By.TAG_NAME, "th")
+                if header_cells:
+                    return True
+        time.sleep(1)
+    return False
 
 
 def parse_html_table(driver, table_index=0):
@@ -136,7 +155,6 @@ def parse_html_table(driver, table_index=0):
     if not rows:
         return []
 
-    # Get headers from first row
     header_cells = rows[0].find_elements(By.TAG_NAME, "th")
     if not header_cells:
         header_cells = rows[0].find_elements(By.TAG_NAME, "td")
@@ -145,65 +163,53 @@ def parse_html_table(driver, table_index=0):
     if not headers:
         return []
 
-    # Parse data rows
     data = []
     for row in rows[1:]:
         cells = row.find_elements(By.TAG_NAME, "td")
         if len(cells) == len(headers):
             record = {headers[i]: cells[i].text.strip() for i in range(len(headers))}
-            data.append(record)
+            # Skip empty/total rows
+            if any(v for v in record.values()):
+                data.append(record)
 
     return data
 
 
 def find_data_table(driver):
-    """Find the main data table on the page, trying multiple strategies."""
+    """Find the main data table on the page."""
     tables = driver.find_elements(By.TAG_NAME, "table")
     harvest_keywords = {"hunt", "year", "gmu", "harvest", "hunter", "permit", "success",
                         "killed", "hunted", "unit", "species", "num_permits", "num_hunters",
                         "num_harvested", "did_hunt", "reporting"}
 
     for i, table in enumerate(tables):
-        header_row = table.find_elements(By.TAG_NAME, "tr")
-        if not header_row:
+        rows = table.find_elements(By.TAG_NAME, "tr")
+        if not rows or len(rows) < 2:
             continue
-        header_cells = header_row[0].find_elements(By.TAG_NAME, "th")
+        header_cells = rows[0].find_elements(By.TAG_NAME, "th")
         if not header_cells:
-            header_cells = header_row[0].find_elements(By.TAG_NAME, "td")
+            header_cells = rows[0].find_elements(By.TAG_NAME, "td")
         header_text = {cell.text.strip().lower().replace(" ", "_") for cell in header_cells}
         if header_text & harvest_keywords:
             return parse_html_table(driver, i)
 
-    # Fallback: parse largest table
+    # Fallback: largest table with > 2 rows
     if tables:
-        largest_idx = 0
-        largest_rows = 0
+        largest_idx = -1
+        largest_rows = 2
         for i, table in enumerate(tables):
             row_count = len(table.find_elements(By.TAG_NAME, "tr"))
             if row_count > largest_rows:
                 largest_rows = row_count
                 largest_idx = i
-        if largest_rows > 1:
+        if largest_idx >= 0:
             return parse_html_table(driver, largest_idx)
 
     return []
 
 
-def wait_for_download(download_dir, timeout=30):
-    """Wait for a file to appear in the download directory."""
-    start = time.time()
-    while time.time() - start < timeout:
-        files = globmod.glob(os.path.join(download_dir, "*"))
-        # Filter out partial downloads (.crdownload, .tmp)
-        complete = [f for f in files if not f.endswith((".crdownload", ".tmp", ".part"))]
-        if complete:
-            return max(complete, key=os.path.getmtime)
-        time.sleep(1)
-    return None
-
-
 def discover_page_elements(driver, url):
-    """Navigate to a URL and report all form elements found. For debugging."""
+    """Navigate to a URL and report all form elements found."""
     driver.get(url)
     time.sleep(3)
 
@@ -222,7 +228,8 @@ def discover_page_elements(driver, url):
         suffix = f" ... (+{len(options)-10} more)" if len(options) > 10 else ""
         print(f"  id='{sel_id}' name='{sel_name}': {option_texts}{suffix}")
 
-    buttons = driver.find_elements(By.CSS_SELECTOR, "input[type='submit'], button[type='submit'], input[type='button']")
+    buttons = driver.find_elements(By.CSS_SELECTOR,
+        "input[type='submit'], button[type='submit'], input[type='button']")
     print(f"\nButtons ({len(buttons)}):")
     for btn in buttons:
         btn_id = btn.get_attribute("id") or "(no id)"
@@ -231,8 +238,9 @@ def discover_page_elements(driver, url):
         print(f"  id='{btn_id}' name='{btn_name}' value='{btn_val}'")
 
     links = driver.find_elements(By.TAG_NAME, "a")
-    harvest_links = [l for l in links if any(kw in (l.text.lower() + (l.get_attribute("href") or "").lower())
-                                              for kw in ["download", "export", "csv", "lookup", "report", "harvest"])]
+    harvest_links = [l for l in links if any(
+        kw in (l.text.lower() + (l.get_attribute("href") or "").lower())
+        for kw in ["download", "export", "csv", "lookup", "report", "harvest"])]
     print(f"\nRelevant links ({len(harvest_links)}):")
     for link in harvest_links:
         href = link.get_attribute("href") or "(no href)"
@@ -244,55 +252,50 @@ def discover_page_elements(driver, url):
         rows = table.find_elements(By.TAG_NAME, "tr")
         print(f"  Table {i}: {len(rows)} rows")
         if rows:
-            cells = rows[0].find_elements(By.TAG_NAME, "th") or rows[0].find_elements(By.TAG_NAME, "td")
-            headers = [c.text.strip() for c in cells]
+            cells = (rows[0].find_elements(By.TAG_NAME, "th") or
+                     rows[0].find_elements(By.TAG_NAME, "td"))
+            headers = [c.text.strip()[:50] for c in cells]
             print(f"    Headers: {headers}")
 
     print()
 
 
-def scrape_harvest_lookup(driver, species_list, year_start, year_end, download_dir=None):
+def scrape_harvest_lookup(driver, species_list, year_start, year_end):
     """
-    Scrape the Harvest Lookup tool using the 'Create Excel File' button.
+    Scrape the Harvest Lookup tool via 'Display Records'.
 
-    Page elements (confirmed via discover):
-      - id='year' name='YEAR': year dropdown
-      - id='species' name='Species': species dropdown
-      - value='Create Excel File': downloads Excel with all records
-      - value='Display Records': shows results in browser
+    Confirmed elements: id='year', id='species', button 'Display Records'
     """
     all_records = {}
 
     for species in species_list:
         species_cap = species.capitalize()
-        print(f"\n--- Scraping Harvest Lookup: {species_cap} ---")
+        print(f"\n--- Harvest Lookup: {species_cap} ---")
         records = []
 
         for year in range(year_start, year_end + 1):
-            print(f"  Year {year}...", end=" ", flush=True)
+            print(f"  {year}...", end=" ", flush=True)
+            iter_start = time.time()
 
             try:
                 driver.get(HARVEST_LOOKUP_URL)
                 time.sleep(POLITE_DELAY)
 
-                # Select year (id='year')
                 if not select_by_id(driver, "year", str(year)):
-                    print("SKIP (year)")
+                    print("SKIP")
                     continue
-
-                # Select species (id='species')
                 if not select_by_id(driver, "species", species_cap):
-                    print("SKIP (species)")
+                    print("SKIP")
                     continue
-
-                # Click 'Display Records' to get results in browser
                 if not click_button(driver, "Display Records"):
-                    print("SKIP (no Display Records button)")
+                    print("SKIP")
                     continue
 
-                time.sleep(POLITE_DELAY + 2)  # extra wait for results to load
+                # Wait for results with timeout
+                if not wait_for_results(driver, timeout=15):
+                    print("no results (timeout)")
+                    continue
 
-                # Parse the results table
                 table_data = find_data_table(driver)
                 if table_data:
                     for row in table_data:
@@ -303,12 +306,21 @@ def scrape_harvest_lookup(driver, species_list, year_start, year_end, download_d
                 else:
                     print("no data")
 
-            except (TimeoutException, StaleElementReferenceException) as e:
-                print(f"ERROR: {e}")
+            except TimeoutException:
+                print("TIMEOUT (page load)")
                 continue
+            except (StaleElementReferenceException, WebDriverException) as e:
+                print(f"ERROR: {type(e).__name__}")
+                continue
+
+            elapsed = time.time() - iter_start
+            if elapsed > PER_ITERATION_TIMEOUT:
+                print(f"  (took {elapsed:.0f}s, continuing)")
 
         if records:
             all_records[species] = records
+            # Save after each species so partial results aren't lost
+            save_records({species: records})
 
     return all_records
 
@@ -317,43 +329,37 @@ def scrape_harvest_reports(driver, species_list, year_start, year_end):
     """
     Scrape the General Harvest Reports tool.
 
-    Page elements (confirmed via discover):
-      - name='YEAR' (no id): year dropdown
-      - name='Species' (no id): species dropdown
-      - value='Get Reports': generates the report table
+    Confirmed elements: name='YEAR', name='Species', button 'Get Reports'
     """
     all_records = {}
 
     for species in species_list:
         species_cap = species.capitalize()
-        print(f"\n--- Scraping Harvest Reports: {species_cap} ---")
+        print(f"\n--- Harvest Reports: {species_cap} ---")
         records = []
 
         for year in range(year_start, year_end + 1):
-            print(f"  Year {year}...", end=" ", flush=True)
+            print(f"  {year}...", end=" ", flush=True)
 
             try:
                 driver.get(HARVEST_REPORTS_URL)
                 time.sleep(POLITE_DELAY)
 
-                # Select year (name='YEAR', no id)
                 if not select_by_name(driver, "YEAR", str(year)):
-                    print("SKIP (year)")
+                    print("SKIP")
                     continue
-
-                # Select species (name='Species', no id)
                 if not select_by_name(driver, "Species", species_cap):
-                    print("SKIP (species)")
+                    print("SKIP")
                     continue
-
-                # Click 'Get Reports'
                 if not click_button(driver, "Get Reports"):
-                    print("SKIP (no Get Reports button)")
+                    print("SKIP")
                     continue
 
-                time.sleep(POLITE_DELAY + 2)  # extra wait for report to generate
+                # Wait for results with timeout
+                if not wait_for_results(driver, timeout=15):
+                    print("no results (timeout)")
+                    continue
 
-                # Parse the results table
                 table_data = find_data_table(driver)
                 if table_data:
                     for row in table_data:
@@ -364,34 +370,34 @@ def scrape_harvest_reports(driver, species_list, year_start, year_end):
                 else:
                     print("no data")
 
-            except (TimeoutException, StaleElementReferenceException) as e:
-                print(f"ERROR: {e}")
+            except TimeoutException:
+                print("TIMEOUT (page load)")
+                continue
+            except (StaleElementReferenceException, WebDriverException) as e:
+                print(f"ERROR: {type(e).__name__}")
                 continue
 
         if records:
             all_records[species] = records
+            # Save after each species so partial results aren't lost
+            save_records({species: records})
 
     return all_records
 
 
 def normalize_records(records):
-    """
-    Normalize scraped records into a consistent format.
-
-    Input records may have varying column names depending on the source page.
-    Output columns: hunt, year, gmu, permits, hunters, harvest, success_rate
-    """
+    """Normalize scraped records into a consistent output format."""
     normalized = []
 
-    # Column name mapping (ADFG pages use various naming conventions)
     col_map = {
         "hunt": ["hunt", "hunt_num", "hunt_no", "hunt_number", "hunt_code"],
         "gmu": ["gmu", "unit", "game_management_unit", "area"],
         "permits": ["permits", "permits_issued", "num_permits", "total_permits"],
         "hunters": ["hunters", "num_hunters", "total_hunters", "did_hunt", "hunted"],
-        "harvest": ["harvest", "total_harvest", "num_harvested", "killed", "animals_harvested", "harvested"],
-        "success_rate": ["success_rate", "%_success", "success_%", "success", "pct_success",
-                         "percent_success", "success_percent"],
+        "harvest": ["harvest", "total_harvest", "num_harvested", "killed",
+                     "animals_harvested", "harvested"],
+        "success_rate": ["success_rate", "%_success", "success_%", "success",
+                         "pct_success", "percent_success", "success_percent"],
     }
 
     for record in records:
@@ -403,7 +409,7 @@ def normalize_records(records):
                     row[target] = record[candidate]
                     break
 
-        # Compute success_rate if we have hunters and harvest but no success_rate
+        # Compute success_rate from hunters + harvest if missing
         if "success_rate" not in row and "hunters" in row and "harvest" in row:
             try:
                 hunters = int(row["hunters"])
@@ -433,15 +439,16 @@ def save_records(records_by_species):
         all_cols = set()
         for r in normalized:
             all_cols.update(r.keys())
-        # Preferred column order
+
         ordered_cols = []
-        for col in ["hunt", "year", "gmu", "permits", "hunters", "harvest", "success_rate", "species"]:
+        for col in ["hunt", "year", "gmu", "permits", "hunters", "harvest",
+                     "success_rate", "species"]:
             if col in all_cols:
                 ordered_cols.append(col)
                 all_cols.discard(col)
         ordered_cols.extend(sorted(all_cols))
 
-        # If file exists, merge with existing data
+        # Merge with existing file
         existing = []
         if filepath.exists():
             with open(filepath, "r") as f:
@@ -451,7 +458,7 @@ def save_records(records_by_species):
                     if col not in ordered_cols:
                         ordered_cols.append(col)
 
-        # Merge: use (hunt, year) as key to avoid duplicates
+        # Deduplicate by (hunt, year)
         seen = set()
         merged = []
         for r in normalized + existing:
@@ -460,7 +467,6 @@ def save_records(records_by_species):
                 seen.add(key)
                 merged.append(r)
 
-        # Sort by hunt then year
         merged.sort(key=lambda r: (r.get("hunt", ""), r.get("year", "")))
 
         with open(filepath, "w", newline="") as f:
@@ -468,11 +474,10 @@ def save_records(records_by_species):
             writer.writeheader()
             writer.writerows(merged)
 
-        print(f"\nSaved {len(merged)} records to {filepath}")
+        print(f"  -> Saved {len(merged)} records to {filepath}")
 
 
 def parse_year_range(year_str):
-    """Parse a year range string like '2010-2024' into (start, end)."""
     if "-" in year_str:
         parts = year_str.split("-")
         return int(parts[0]), int(parts[1])
@@ -482,7 +487,6 @@ def parse_year_range(year_str):
 
 
 def parse_species(species_str):
-    """Parse a species string like 'caribou,sheep' or 'all' into a list."""
     if species_str.lower() == "all":
         return ALL_SPECIES
     return [s.strip().lower() for s in species_str.split(",")]
@@ -492,33 +496,16 @@ def main():
     parser = argparse.ArgumentParser(
         description="Scrape hunting harvest data from Alaska Dept of Fish & Game"
     )
-    parser.add_argument(
-        "--source",
-        choices=["lookup", "reports", "both"],
-        default="both",
-        help="Which ADFG data source to scrape (default: both)",
-    )
-    parser.add_argument(
-        "--species",
-        default="all",
-        help="Comma-separated species or 'all' (default: all). "
-             f"Available: {', '.join(ALL_SPECIES)}",
-    )
-    parser.add_argument(
-        "--years",
-        default="2010-2024",
-        help="Year range to scrape, e.g., '2010-2024' (default: 2010-2024)",
-    )
-    parser.add_argument(
-        "--interactive",
-        action="store_true",
-        help="Open a visible browser window for debugging (default: headless)",
-    )
-    parser.add_argument(
-        "--discover",
-        action="store_true",
-        help="Just discover page elements and print them (for debugging)",
-    )
+    parser.add_argument("--source", choices=["lookup", "reports", "both"],
+                        default="both")
+    parser.add_argument("--species", default="all",
+                        help=f"Comma-separated or 'all'. Available: {', '.join(ALL_SPECIES)}")
+    parser.add_argument("--years", default="2010-2024",
+                        help="Year range, e.g. '2010-2024'")
+    parser.add_argument("--interactive", action="store_true",
+                        help="Open visible browser for debugging")
+    parser.add_argument("--discover", action="store_true",
+                        help="Just print page elements (for debugging)")
 
     args = parser.parse_args()
 
@@ -529,6 +516,7 @@ def main():
     print(f"Years: {year_start}-{year_end}")
     print(f"Source: {args.source}")
     print(f"Mode: {'interactive' if args.interactive else 'headless'}")
+    print(f"Timeouts: page={PAGE_LOAD_TIMEOUT}s, wait={PER_ITERATION_TIMEOUT}s")
     print()
 
     driver = create_driver(interactive=args.interactive)
@@ -553,11 +541,11 @@ def main():
 
         if all_records:
             save_records(all_records)
-            print(f"\nDone! Scraped data for: {', '.join(all_records.keys())}")
+            total = sum(len(v) for v in all_records.values())
+            print(f"\nDone! {total} total records for: {', '.join(all_records.keys())}")
         else:
             print("\nNo data was collected.")
-            print("Try running with --interactive --discover to inspect the page structure.")
-            print("The ADFG site may have changed its layout since this scraper was written.")
+            print("Try --discover to inspect page structure.")
 
     finally:
         driver.quit()

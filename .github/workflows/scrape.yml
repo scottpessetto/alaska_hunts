@@ -1,24 +1,22 @@
 name: Scrape ADFG Data
 
-# Trigger manually from GitHub (works from phone)
 on:
   workflow_dispatch:
     inputs:
       mode:
         description: "Mode: 'scrape' to collect data, 'discover' to inspect page elements"
         required: true
-        default: "discover"
+        default: "scrape"
         type: choice
         options:
-          - discover
           - scrape
+          - discover
       species:
         description: "Species to scrape (ignored in discover mode)"
         required: true
-        default: "all"
+        default: "caribou"
         type: choice
         options:
-          - all
           - caribou
           - sheep
           - moose
@@ -28,24 +26,26 @@ on:
           - muskox
           - caribou,sheep
           - caribou,sheep,moose
+          - all
       years:
         description: "Year range (ignored in discover mode)"
         required: true
-        default: "2010-2024"
+        default: "2023-2024"
         type: string
       source:
         description: "Data source (ignored in discover mode)"
         required: true
-        default: "both"
+        default: "reports"
         type: choice
         options:
-          - both
-          - lookup
           - reports
+          - lookup
+          - both
 
 jobs:
   scrape:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     permissions:
       contents: write
 
@@ -66,16 +66,15 @@ jobs:
           chrome-version: "stable"
 
       - name: Install dependencies
-        run: |
-          pip install selenium webdriver-manager pandas
+        run: pip install selenium webdriver-manager pandas
 
       - name: Run scraper (discover mode)
         if: inputs.mode == 'discover'
-        run: |
-          python scraper.py --discover 2>&1 | tee discover_output.txt
+        run: python scraper.py --discover 2>&1 | tee discover_output.txt
 
       - name: Run scraper (scrape mode)
         if: inputs.mode == 'scrape'
+        timeout-minutes: 15
         run: |
           python scraper.py \
             --source ${{ inputs.source }} \
@@ -114,17 +113,20 @@ jobs:
             snapshots/
 
       - name: Check for new data
-        if: inputs.mode == 'scrape'
+        if: always() && inputs.mode == 'scrape'
         id: check
         run: |
           if [ -n "$(git status data/ --porcelain)" ]; then
             echo "has_changes=true" >> $GITHUB_OUTPUT
+            echo "New/updated CSV files:"
+            git status data/ --short
           else
             echo "has_changes=false" >> $GITHUB_OUTPUT
+            echo "No new data files"
           fi
 
       - name: Commit and push data
-        if: inputs.mode == 'scrape' && steps.check.outputs.has_changes == 'true'
+        if: always() && inputs.mode == 'scrape' && steps.check.outputs.has_changes == 'true'
         run: |
           git config user.name "ADFG Scraper Bot"
           git config user.email "github-actions[bot]@users.noreply.github.com"
@@ -133,7 +135,7 @@ jobs:
           git push
 
       - name: Upload scrape output
-        if: inputs.mode == 'scrape'
+        if: always() && inputs.mode == 'scrape'
         uses: actions/upload-artifact@v4
         with:
           name: scrape-results
