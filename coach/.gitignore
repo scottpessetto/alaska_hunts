@@ -1,5 +1,6 @@
 # Secrets
 config/twilio.env
+config/ntfy.env
 
 # Runtime data (keep structure, ignore daily files)
 data/garmin/*.yaml

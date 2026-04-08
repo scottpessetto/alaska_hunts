@@ -160,14 +160,17 @@ else
     log "WARNING: Context rewrite failed, keeping previous version"
 fi
 
-# --- Send text/WhatsApp ---
+# --- Send push notification ---
 
-if [ -f "$COACH_DIR/config/twilio.env" ]; then
-    log "Sending weekly analysis via text..."
-    python3 "$COACH_DIR/scripts/send_text.py" --file "$OUTPUT_FILE" --whatsapp 2>&1 || \
-        log "WARNING: Text delivery failed"
+if [ -f "$COACH_DIR/config/ntfy.env" ]; then
+    log "Sending weekly analysis via ntfy..."
+    bash "$COACH_DIR/scripts/notify.sh" \
+        --title "Weekly Analysis - $WEEK" \
+        --priority high \
+        --file "$OUTPUT_FILE" 2>&1 || \
+        log "WARNING: Push notification failed"
 else
-    log "Twilio not configured, skipping text delivery"
+    log "ntfy not configured, skipping notification"
 fi
 
 log "Weekly analysis complete"

@@ -135,14 +135,16 @@ else
     log "WARNING: Context update failed, keeping previous version"
 fi
 
-# --- Send text/WhatsApp ---
+# --- Send push notification ---
 
-if [ -f "$COACH_DIR/config/twilio.env" ]; then
-    log "Sending briefing via text..."
-    python3 "$COACH_DIR/scripts/send_text.py" --file "$OUTPUT_FILE" --whatsapp 2>&1 || \
-        log "WARNING: Text delivery failed"
+if [ -f "$COACH_DIR/config/ntfy.env" ]; then
+    log "Sending briefing via ntfy..."
+    bash "$COACH_DIR/scripts/notify.sh" \
+        --title "Daily Briefing - $DAY_OF_WEEK" \
+        --file "$OUTPUT_FILE" 2>&1 || \
+        log "WARNING: Push notification failed"
 else
-    log "Twilio not configured, skipping text delivery"
+    log "ntfy not configured, skipping notification"
 fi
 
 log "Daily briefing complete"
