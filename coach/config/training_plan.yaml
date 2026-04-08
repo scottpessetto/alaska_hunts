@@ -1,0 +1,62 @@
+# Training Plan for Penguin Ridge - August 2026
+# Convert your existing spreadsheet into this format.
+# Each week has target metrics and daily workout prescriptions.
+
+plan_start: 2026-04-06
+goal_race: Penguin Ridge
+goal_date: 2026-08-15
+current_phase: base_building
+
+hr_zones:
+  z1_recovery: [0, 135]
+  z2_easy: [135, 150]
+  z3_tempo: [150, 163]
+  z4_threshold: [163, 172]
+  z5_vo2max: [172, 185]
+
+weeks:
+  - week_of: 2026-04-06
+    phase: base_building
+    target_miles: 35
+    target_vert_ft: 4000
+    long_run_miles: 12
+    quality_sessions: 1
+    days:
+      monday:
+        type: rest
+        notes: "Complete rest or easy walk"
+      tuesday:
+        type: easy
+        distance_mi: 6
+        target_zone: z2_easy
+        notes: "Flat to rolling, conversational pace"
+      wednesday:
+        type: hills
+        distance_mi: 7
+        target_zone: z3_tempo
+        vert_ft: 1200
+        notes: "Hill repeats: 6x3min uphill at tempo effort"
+      thursday:
+        type: easy
+        distance_mi: 5
+        target_zone: z2_easy
+      friday:
+        type: rest
+      saturday:
+        type: long_run
+        distance_mi: 12
+        target_zone: z2_easy
+        vert_ft: 2000
+        notes: "Mountain trail, practice nutrition"
+      sunday:
+        type: easy
+        distance_mi: 5
+        target_zone: z1_recovery
+        notes: "Recovery pace, flat"
+
+  # Add more weeks below following the same structure.
+  # Copy from your spreadsheet - each week gets its own entry.
+  # - week_of: 2026-04-13
+  #   phase: base_building
+  #   target_miles: 37
+  #   ...

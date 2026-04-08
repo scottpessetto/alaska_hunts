@@ -1,0 +1,22 @@
+# Secrets
+config/twilio.env
+
+# Runtime data (keep structure, ignore daily files)
+data/garmin/*.yaml
+data/strava/*.yaml
+data/checkins/*.yaml
+output/daily/*.md
+output/weekly/*.md
+# athlete_context.md is committed as a seed template.
+# It gets rewritten at runtime by Claude Code.
+memory/weekly_snapshots/*.md
+logs/*.log
+
+# Keep directories via .gitkeep
+!data/garmin/.gitkeep
+!data/strava/.gitkeep
+!data/checkins/.gitkeep
+!output/daily/.gitkeep
+!output/weekly/.gitkeep
+!memory/weekly_snapshots/.gitkeep
+!logs/.gitkeep

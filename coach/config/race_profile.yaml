@@ -1,0 +1,30 @@
+# Penguin Ridge Race Profile
+# Fill in actual race details as available.
+
+name: Penguin Ridge
+date: 2026-08-15
+location: TBD
+distance_mi: 50
+elevation_gain_ft: 10000
+elevation_loss_ft: 10000
+max_altitude_ft: 5000
+aid_stations: 6
+cutoff_hours: 14
+terrain: "Mountain trails, alpine ridgeline, technical descents"
+weather_notes: "Expect variable mountain weather. Potential for rain, wind, cold at altitude."
+
+key_challenges:
+  - "Extended ridgeline exposure above treeline"
+  - "Technical rocky descent sections"
+  - "Significant cumulative vertical gain"
+  - "Potential altitude effects"
+
+gear_required:
+  - "Mandatory gear list TBD from race organizer"
+  - "Rain shell"
+  - "Headlamp (if close to cutoff)"
+
+nutrition_plan:
+  target_cal_per_hour: 250
+  target_fluid_oz_per_hour: 20
+  strategy: "Practice during long runs starting 8 weeks out"
